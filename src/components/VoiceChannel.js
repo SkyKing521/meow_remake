@@ -331,29 +331,30 @@ const VoiceChannel = ({ channelId }) => {
             case 'participants':
                 if (Array.isArray(data.participants)) {
                     setParticipants(data.participants);
-                    setIsEchoMode(data.isEchoMode);
                 }
                 break;
             case 'participant_joined':
                 if (data.participant) {
                     setParticipants(prev => [...prev, data.participant]);
-                    setIsEchoMode(data.isEchoMode);
                 }
                 break;
             case 'participant_left':
                 if (data.userId) {
                     setParticipants(prev => prev.filter(p => p.id !== data.userId));
-                    setIsEchoMode(data.isEchoMode);
                 }
                 break;
             case 'audio':
-                if (!isDeafened && data.data) {
+                console.log('Получено аудио-сообщение:', data);
+                if (!isDeafened && data.data && data.channel_id === channelId) {
+                    console.log('Вызов playAudio для входящего аудио');
                     playAudio(data.data);
                 }
                 break;
             case 'echo':
                 // Handle echo message
-                if (data.original_message && data.original_message.type === 'audio') {
+                if (data.original_message && 
+                    data.original_message.type === 'audio' && 
+                    data.original_message.channel_id === channelId) {
                     console.log('Received echo audio data');
                     if (!isDeafened && data.original_message.data) {
                         playAudio(data.original_message.data);
@@ -445,35 +446,27 @@ const VoiceChannel = ({ channelId }) => {
 
     const startAudioStream = async () => {
         try {
+            if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+                setError('Your browser does not support audio devices or the site is not served over http/https!');
+                console.error('navigator.mediaDevices.getUserMedia is not available');
+                return;
+            }
+
             console.log('Starting audio stream...');
             const constraints = {
                 audio: {
-                    deviceId: selectedDevices.input ? { exact: selectedDevices.input } : undefined,
                     echoCancellation: true,
                     noiseSuppression: true,
                     autoGainControl: true,
                     sampleRate: 48000,
-                    channelCount: 2,
-                    latency: 0,
-                    googEchoCancellation: true,
-                    googAutoGainControl: true,
-                    googNoiseSuppression: true,
-                    googHighpassFilter: true
+                    channelCount: 1,
+                    latency: 0
                 }
             };
-
-            // Проверяем доступность устройства перед использованием
-            const devices = await navigator.mediaDevices.enumerateDevices();
-            const selectedDevice = devices.find(d => d.deviceId === selectedDevices.input);
-            
-            if (!selectedDevice) {
-                throw new Error('Selected audio device not found');
-            }
 
             const stream = await navigator.mediaDevices.getUserMedia(constraints);
             console.log('Got media stream:', stream.getAudioTracks()[0].label);
 
-            // Очищаем предыдущие потоки перед установкой новых
             if (mediaStreamRef.current) {
                 mediaStreamRef.current.getTracks().forEach(track => track.stop());
             }
@@ -484,16 +477,14 @@ const VoiceChannel = ({ channelId }) => {
                 latencyHint: 'interactive'
             });
             audioContextRef.current = audioContext;
-            
+
             const source = audioContext.createMediaStreamSource(stream);
-            const processor = audioContext.createScriptProcessor(4096, 2, 2);
+            const processor = audioContext.createScriptProcessor(1024, 1, 1);
             setAudioProcessor(processor);
 
-            // Улучшенная цепочка обработки звука
             const gainNode = audioContext.createGain();
             gainNode.gain.value = 1.0;
 
-            // Добавляем компрессор для улучшения качества
             const compressor = audioContext.createDynamicsCompressor();
             compressor.threshold.value = -50;
             compressor.knee.value = 40;
@@ -501,36 +492,32 @@ const VoiceChannel = ({ channelId }) => {
             compressor.attack.value = 0;
             compressor.release.value = 0.25;
 
-            // Подключаем цепочку
             source.connect(compressor);
             compressor.connect(gainNode);
             gainNode.connect(processor);
             processor.connect(audioContext.destination);
 
             processor.onaudioprocess = (e) => {
+                console.log('onaudioprocess called');
                 if (!isMuted && wsRef.current?.readyState === WebSocket.OPEN) {
                     const inputData = e.inputBuffer.getChannelData(0);
-                    
-                    // Улучшенная обработка аудио данных
                     const pcmData = new Int16Array(inputData.length);
                     for (let i = 0; i < inputData.length; i++) {
-                        // Добавляем мягкое ограничение для предотвращения клиппинга
                         const sample = Math.max(-0.99, Math.min(0.99, inputData[i]));
                         pcmData[i] = Math.round(sample * 32767);
                     }
-                    
                     const buffer = new ArrayBuffer(pcmData.length * 2);
                     const view = new DataView(buffer);
                     for (let i = 0; i < pcmData.length; i++) {
                         view.setInt16(i * 2, pcmData[i], true);
                     }
-                    
                     const base64Data = btoa(String.fromCharCode.apply(null, new Uint8Array(buffer)));
-                    
+                    console.log('Отправка аудио пакета', pcmData.length, wsRef.current?.readyState);
                     try {
                         wsRef.current.send(JSON.stringify({
                             type: 'audio',
                             data: base64Data,
+                            channel_id: channelId,
                             timestamp: Date.now()
                         }));
                     } catch (error) {
@@ -544,7 +531,7 @@ const VoiceChannel = ({ channelId }) => {
         } catch (error) {
             console.error('Error starting audio stream:', error);
             setError('Failed to access microphone. Please make sure you have granted microphone permissions.');
-            throw error; // Пробрасываем ошибку для обработки в handleJoinChannel
+            throw error;
         }
     };
 
@@ -656,46 +643,39 @@ const VoiceChannel = ({ channelId }) => {
 
     const playAudio = async (audioData) => {
         try {
+            console.log('playAudio вызван, audioData:', audioData);
             // Конвертируем base64 обратно в Int16Array
             const binaryString = atob(audioData);
             const bytes = new Uint8Array(binaryString.length);
             for (let i = 0; i < binaryString.length; i++) {
                 bytes[i] = binaryString.charCodeAt(i);
             }
-            
             const int16Data = new Int16Array(bytes.buffer);
             const float32Data = new Float32Array(int16Data.length);
             for (let i = 0; i < int16Data.length; i++) {
                 float32Data[i] = int16Data[i] / 32767.0;
             }
-            
+            // Используем sampleRate 48000 для совместимости
             const audioContext = new (window.AudioContext || window.webkitAudioContext)({
-                sampleRate: 16000,
+                sampleRate: 48000,
                 latencyHint: 'interactive'
             });
-            
-            const audioBuffer = audioContext.createBuffer(1, float32Data.length, 16000);
+            const audioBuffer = audioContext.createBuffer(1, float32Data.length, 48000);
             audioBuffer.getChannelData(0).set(float32Data);
-            
-            // Минимальная цепочка воспроизведения
             const source = audioContext.createBufferSource();
             const gainNode = audioContext.createGain();
             gainNode.gain.value = volume / 100;
-            
-            // Подключаем цепочку
             source.buffer = audioBuffer;
             source.connect(gainNode);
             gainNode.connect(audioContext.destination);
-            
             source.onended = () => {
                 source.disconnect();
                 gainNode.disconnect();
                 audioContext.close();
             };
-            
             source.start(0);
         } catch (error) {
-            console.error('Error playing audio:', error);
+            console.error('Ошибка воспроизведения аудио:', error);
         }
     };
 
@@ -1128,12 +1108,6 @@ const VoiceChannel = ({ channelId }) => {
                     {connectionStatus === 'connecting' && (
                         <Alert severity="info" sx={{ mb: 2 }}>
                             Connecting to voice channel...
-                        </Alert>
-                    )}
-
-                    {isEchoMode && (
-                        <Alert severity="info" sx={{ mb: 2 }}>
-                            Echo Mode Active - You are the only participant in this voice channel
                         </Alert>
                     )}
 

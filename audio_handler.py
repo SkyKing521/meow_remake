@@ -3,41 +3,73 @@ import wave
 import io
 import asyncio
 from typing import Dict, Optional
+import subprocess
+import tempfile
+import os
+import base64
 
 class AudioHandler:
     def __init__(self):
         self.p = pyaudio.PyAudio()
-        self.streams: Dict[int, pyaudio.Stream] = {}
+        self.streams = {}  # (channel_id, user_id) -> stream
         self.audio_format = pyaudio.paInt16
-        self.channels = 1
-        self.rate = 48000
+        self.channels = 1  # Mono
+        self.rate = 48000  # Совпадает с фронтом
         self.chunk = 1024
+        self._check_audio_devices()
 
-    def create_input_stream(self, user_id: int) -> Optional[pyaudio.Stream]:
+    def _check_audio_devices(self):
+        """Проверка наличия аудио устройств"""
+        input_devices = []
+        output_devices = []
+        
+        for i in range(self.p.get_device_count()):
+            device_info = self.p.get_device_info_by_index(i)
+            if device_info.get('maxInputChannels') > 0:
+                input_devices.append(device_info)
+            if device_info.get('maxOutputChannels') > 0:
+                output_devices.append(device_info)
+        
+        if not input_devices:
+            raise RuntimeError("No input devices found")
+        if not output_devices:
+            raise RuntimeError("No output devices found")
+
+    def create_input_stream(self, stream_id) -> Optional[pyaudio.Stream]:
         try:
+            # Проверяем, не существует ли уже поток
+            if stream_id in self.streams:
+                self.close_stream(stream_id)
+            
             stream = self.p.open(
                 format=self.audio_format,
                 channels=self.channels,
                 rate=self.rate,
                 input=True,
-                frames_per_buffer=self.chunk
+                frames_per_buffer=self.chunk,
+                input_device_index=None  # Используем устройство по умолчанию
             )
-            self.streams[user_id] = stream
+            self.streams[stream_id] = stream
             return stream
         except Exception as e:
             print(f"Error creating input stream: {e}")
             return None
 
-    def create_output_stream(self, user_id: int) -> Optional[pyaudio.Stream]:
+    def create_output_stream(self, stream_id) -> Optional[pyaudio.Stream]:
         try:
+            # Проверяем, не существует ли уже поток
+            if stream_id in self.streams:
+                self.close_stream(stream_id)
+            
             stream = self.p.open(
                 format=self.audio_format,
                 channels=self.channels,
                 rate=self.rate,
                 output=True,
-                frames_per_buffer=self.chunk
+                frames_per_buffer=self.chunk,
+                output_device_index=None  # Используем устройство по умолчанию
             )
-            self.streams[user_id] = stream
+            self.streams[stream_id] = stream
             return stream
         except Exception as e:
             print(f"Error creating output stream: {e}")
@@ -45,37 +77,77 @@ class AudioHandler:
 
     def process_audio(self, audio_data: bytes) -> bytes:
         try:
-            # Convert WebM audio to raw PCM
-            with io.BytesIO(audio_data) as webm_file:
-                # Here you would implement WebM to PCM conversion
-                # For now, we'll just return the raw data
-                return audio_data
+            # Если данные уже в формате base64, декодируем их
+            if isinstance(audio_data, str):
+                try:
+                    audio_data = base64.b64decode(audio_data)
+                except:
+                    pass
+
+            # Создаем временный файл для WebM
+            with tempfile.NamedTemporaryFile(suffix='.webm', delete=False) as webm_file:
+                webm_file.write(audio_data)
+                webm_path = webm_file.name
+
+            # Создаем временный файл для PCM
+            pcm_path = webm_path + '.pcm'
+
+            try:
+                # Конвертируем WebM в PCM используя ffmpeg
+                subprocess.run([
+                    'ffmpeg', '-i', webm_path,
+                    '-f', 's16le',  # 16-bit PCM
+                    '-ar', str(self.rate),  # Sample rate
+                    '-ac', str(self.channels),  # Channels
+                    pcm_path
+                ], check=True, capture_output=True)
+
+                # Читаем PCM данные
+                with open(pcm_path, 'rb') as pcm_file:
+                    pcm_data = pcm_file.read()
+
+                return pcm_data
+
+            finally:
+                # Удаляем временные файлы
+                try:
+                    os.unlink(webm_path)
+                    os.unlink(pcm_path)
+                except:
+                    pass
+
         except Exception as e:
             print(f"Error processing audio: {e}")
             return b''
 
-    def play_audio(self, user_id: int, audio_data: bytes):
+    def play_audio(self, stream_id, audio_data: bytes):
         try:
-            if user_id in self.streams:
-                stream = self.streams[user_id]
+            if stream_id in self.streams:
+                stream = self.streams[stream_id]
                 processed_data = self.process_audio(audio_data)
-                stream.write(processed_data)
+                if processed_data:
+                    # Проверяем, что поток активен
+                    if not stream.is_active():
+                        stream.start_stream()
+                    stream.write(processed_data)
         except Exception as e:
             print(f"Error playing audio: {e}")
 
-    def close_stream(self, user_id: int):
-        if user_id in self.streams:
+    def close_stream(self, stream_id):
+        if stream_id in self.streams:
             try:
-                self.streams[user_id].stop_stream()
-                self.streams[user_id].close()
-                del self.streams[user_id]
+                stream = self.streams[stream_id]
+                if stream.is_active():
+                    stream.stop_stream()
+                stream.close()
+                del self.streams[stream_id]
             except Exception as e:
                 print(f"Error closing stream: {e}")
 
     def cleanup(self):
-        for user_id in list(self.streams.keys()):
-            self.close_stream(user_id)
+        for stream_id in list(self.streams.keys()):
+            self.close_stream(stream_id)
         self.p.terminate()
 
 # Create a global instance
-audio_handler = AudioHandler() 
+audio_handler = AudioHandler()

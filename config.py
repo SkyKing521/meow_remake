@@ -1,5 +1,5 @@
 # Server configuration
-SERVER_IP = "localhost"  # Changed to localhost for local development
+SERVER_IP = "0.0.0.0"  # Network IP address
 SERVER_PORT = 8000
 
 # Database configuration
@@ -37,5 +37,9 @@ CORS_ORIGINS = [
     "http://127.0.0.1:3000",
     "http://localhost:8000",  # API server
     "ws://localhost:8000",    # WebSocket
-    "wss://localhost:8000"    # Secure WebSocket
+    "wss://localhost:8000",   # Secure WebSocket
+    f"http://{SERVER_IP}:3000",  # Network React server
+    f"http://{SERVER_IP}:8000",  # Network API server
+    f"ws://{SERVER_IP}:8000",    # Network WebSocket
+    f"wss://{SERVER_IP}:8000"    # Network Secure WebSocket
 ] 

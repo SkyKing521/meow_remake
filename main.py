@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status, Request, UploadFile, File, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, HTTPException, status, Request, UploadFile, File, WebSocket, WebSocketDisconnect, Form
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -13,6 +13,7 @@ import websockets
 import os
 import shutil
 import uuid
+import asyncio
 
 from database import *
 import models as models
@@ -45,12 +46,11 @@ app.add_middleware(
         "http://127.0.0.1:3000",
         "http://127.0.0.1:3001",
         "http://127.0.0.1:3002",
-        f"http://{config.SERVER_IP}:3000",
-        f"http://{config.SERVER_IP}:3001",
-        f"http://{config.SERVER_IP}:3002",
-        f"http://{config.SERVER_IP}:8000",
-        f"ws://{config.SERVER_IP}:8000",
-        f"wss://{config.SERVER_IP}:8000"
+        "http://26.34.237.219:3000",
+        "https://26.34.237.219:3000",
+        "https://26.34.237.219:3001",
+        "https://26.34.237.219:3002",
+        "https://26.34.237.219:8000",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -80,70 +80,224 @@ manager = ConnectionManager()
 # Voice channel WebSocket connection manager
 class VoiceChannelManager:
     def __init__(self):
-        self.voice_channels = {}
-        self.user_channels = {}
-        self.audio_streams = {}
-        self.user_websockets = {}  # Add this to track user websockets
+        self.voice_channels = {}  # channel_id -> set of user_ids
+        self.user_channels = {}   # user_id -> channel_id
+        self.audio_streams = {}   # (channel_id, user_id) -> {'input': stream, 'output': stream}
+        self.user_websockets = {} # user_id -> websocket
+        self.connection_locks = {} # channel_id -> asyncio.Lock
+        self._cleanup_task = None
+        self.user_states = {}     # user_id -> {'isMuted': bool, 'isDeafened': bool}
+
+    async def _start_cleanup_task(self):
+        """Запускает периодическую очистку неактивных соединений"""
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._cleanup_inactive_connections())
+
+    async def _cleanup_inactive_connections(self):
+        """Периодически проверяет и очищает неактивные соединения"""
+        while True:
+            try:
+                await asyncio.sleep(300)  # Проверка каждые 5 минут
+                current_time = datetime.now()
+                
+                # Очистка неактивных WebSocket соединений
+                for user_id, websocket in list(self.user_websockets.items()):
+                    if not websocket.client_state.CONNECTED:
+                        await self.disconnect_user(user_id)
+                
+                # Очистка неиспользуемых аудио потоков
+                for stream_id, streams in list(self.audio_streams.items()):
+                    channel_id, user_id = stream_id
+                    if user_id not in self.user_websockets:
+                        audio_handler.close_stream(stream_id)
+                        del self.audio_streams[stream_id]
+            except Exception as e:
+                print(f"Error in cleanup task: {e}")
 
     async def connect_user(self, websocket, channel_id, user_id):
-        if channel_id not in self.voice_channels:
-            self.voice_channels[channel_id] = set()
-        self.voice_channels[channel_id].add(user_id)
-        self.user_channels[user_id] = channel_id
-        self.user_websockets[user_id] = websocket  # Store the websocket
-        
-        # Create audio streams for the user
-        input_stream = audio_handler.create_input_stream(user_id)
-        output_stream = audio_handler.create_output_stream(user_id)
-        if input_stream and output_stream:
-            self.audio_streams[user_id] = {
-                'input': input_stream,
-                'output': output_stream
-            }
-        
-        # Broadcast user joined
-        await self.broadcast_user_joined(channel_id, user_id)
-        
         try:
-            async for message in websocket:
-                try:
-                    data = json.loads(message)
-                    if data['type'] == 'audio':
-                        await self.handle_audio_data(channel_id, user_id, data['data'])
-                    elif data['type'] == 'video':
-                        await self.broadcast_video(channel_id, user_id, data['data'])
-                    elif data['type'] == 'screen':
-                        await self.broadcast_screen(channel_id, user_id, data['data'])
-                except json.JSONDecodeError:
-                    print(f"Invalid JSON message from user {user_id}")
-                except Exception as e:
-                    print(f"Error processing message from user {user_id}: {e}")
-        except websockets.exceptions.ConnectionClosed:
-            print(f"Connection closed for user {user_id}")
-        finally:
-            await self.disconnect_user(user_id)
-
-    async def broadcast_user_joined(self, channel_id, user_id):
-        if channel_id in self.voice_channels:
-            message = {
-                'type': 'participant_joined',
-                'participant': {
-                    'id': user_id,
+            print(f"[VOICE] Attempting to connect user {user_id} to channel {channel_id}")
+            
+            # Получаем или создаем блокировку для канала
+            if channel_id not in self.connection_locks:
+                self.connection_locks[channel_id] = asyncio.Lock()
+            
+            async with self.connection_locks[channel_id]:
+                if channel_id not in self.voice_channels:
+                    self.voice_channels[channel_id] = set()
+                
+                # Проверяем, не подключен ли уже пользователь
+                if user_id in self.user_channels:
+                    old_channel_id = self.user_channels[user_id]
+                    if old_channel_id != channel_id:
+                        print(f"[VOICE] User {user_id} was in channel {old_channel_id}, disconnecting")
+                        await self.disconnect_user(user_id)
+                
+                # Добавляем пользователя в канал
+                self.voice_channels[channel_id].add(user_id)
+                self.user_channels[user_id] = channel_id
+                self.user_websockets[user_id] = websocket
+                
+                # Инициализируем состояние пользователя
+                self.user_states[user_id] = {
                     'isMuted': False,
                     'isDeafened': False,
                     'isVideoEnabled': False,
                     'isScreenSharing': False
+                }
+                
+                # Создаем аудио потоки
+                input_stream = audio_handler.create_input_stream((channel_id, user_id))
+                output_stream = audio_handler.create_output_stream((channel_id, user_id))
+                
+                if input_stream and output_stream:
+                    self.audio_streams[(channel_id, user_id)] = {
+                        'input': input_stream,
+                        'output': output_stream
+                    }
+                    print(f"[VOICE] Audio streams created for user {user_id} in channel {channel_id}")
+                else:
+                    raise RuntimeError("Failed to create audio streams")
+                
+                # Запускаем задачу очистки, если она еще не запущена
+                await self._start_cleanup_task()
+                
+                # Уведомляем других участников
+                await self.broadcast_user_joined(channel_id, user_id)
+                
+                # Отправляем список участников всем пользователям в канале
+                await self.send_participants_list(channel_id)
+                
+                print(f"[VOICE] User {user_id} successfully connected to channel {channel_id}")
+                
+                try:
+                    while True:
+                        try:
+                            data = await websocket.receive()
+                        except WebSocketDisconnect:
+                            print(f"[VOICE] User {user_id} disconnected")
+                            break
+                        except Exception as e:
+                            print(f"[VOICE] Exception in receive: {e}")
+                            break
+                            
+                        if data['type'] == 'websocket.disconnect':
+                            print(f"[VOICE] Disconnect received for user {user_id}")
+                            break
+                            
+                        if 'text' in data:
+                            try:
+                                msg = data['text']
+                                parsed = json.loads(msg)
+                                
+                                if parsed['type'] == 'audio':
+                                    print(f"[VOICE] Received audio from user {user_id}")
+                                    await self.handle_audio_data(channel_id, user_id, parsed['data'])
+                                elif parsed['type'] == 'video':
+                                    await self.broadcast_video(channel_id, user_id, parsed['data'])
+                                elif parsed['type'] == 'screen':
+                                    await self.broadcast_screen(channel_id, user_id, parsed['data'])
+                                elif parsed['type'] == 'state_update':
+                                    # Обновляем состояние пользователя
+                                    if user_id in self.user_states:
+                                        self.user_states[user_id].update(parsed.get('state', {}))
+                                        # Уведомляем других участников об изменении состояния
+                                        await self.broadcast_user_state(channel_id, user_id)
+                                elif parsed['type'] == 'join':
+                                    await self.send_participants_list(channel_id)
+                            except json.JSONDecodeError as e:
+                                print(f"Error decoding message from user {user_id}: {e}")
+                            except Exception as e:
+                                print(f"Error processing message from user {user_id}: {e}")
+                finally:
+                    await self.disconnect_user(user_id)
+        except Exception as e:
+            print(f"Error in connect_user: {e}")
+            await self.disconnect_user(user_id)
+            raise
+
+    async def disconnect_user(self, user_id):
+        try:
+            if user_id in self.user_channels:
+                channel_id = self.user_channels[user_id]
+                
+                # Удаляем пользователя из канала
+                if channel_id in self.voice_channels:
+                    self.voice_channels[channel_id].discard(user_id)
+                    if not self.voice_channels[channel_id]:
+                        del self.voice_channels[channel_id]
+                
+                # Закрываем аудио потоки
+                stream_id = (channel_id, user_id)
+                if stream_id in self.audio_streams:
+                    audio_handler.close_stream(stream_id)
+                    del self.audio_streams[stream_id]
+                
+                # Удаляем WebSocket соединение
+                if user_id in self.user_websockets:
+                    del self.user_websockets[user_id]
+                
+                # Удаляем информацию о канале пользователя
+                del self.user_channels[user_id]
+                
+                # Уведомляем других участников
+                await self.broadcast_user_left(channel_id, user_id)
+                await self.send_participants_list(channel_id)
+        except Exception as e:
+            print(f"Error in disconnect_user: {e}")
+
+    async def handle_audio_data(self, channel_id, sender_id, audio_data):
+        if channel_id in self.voice_channels:
+            for user_id in self.voice_channels[channel_id]:
+                if user_id != sender_id:
+                    try:
+                        websocket = self.user_websockets.get(user_id)
+                        if websocket and websocket.client_state.CONNECTED:
+                            # Проверяем, что аудио данные не пустые
+                            if not audio_data:
+                                print(f"Empty audio data from user {sender_id}")
+                                continue
+
+                            # Отправляем аудио данные
+                            await websocket.send_json({
+                                'type': 'audio',
+                                'sender_id': sender_id,
+                                'data': audio_data,
+                                'channel_id': channel_id,
+                                'timestamp': datetime.now().timestamp()
+                            })
+                            
+                            # Воспроизводим аудио локально
+                            stream_id = (channel_id, user_id)
+                            if stream_id in self.audio_streams:
+                                audio_handler.play_audio(stream_id, audio_data)
+                    except Exception as e:
+                        print(f"Error sending audio to user {user_id}: {e}")
+                        # Если не удалось отправить аудио, отключаем пользователя
+                        await self.disconnect_user(user_id)
+
+    async def broadcast_user_joined(self, channel_id, user_id):
+        if channel_id in self.voice_channels:
+            state = self.user_states.get(user_id, {})
+            message = {
+                'type': 'participant_joined',
+                'participant': {
+                    'id': user_id,
+                    'isMuted': state.get('isMuted', False),
+                    'isDeafened': state.get('isDeafened', False),
+                    'isVideoEnabled': state.get('isVideoEnabled', False),
+                    'isScreenSharing': state.get('isScreenSharing', False)
                 },
-                'isEchoMode': len(self.voice_channels[channel_id]) == 1
+                'channel_id': channel_id
             }
+            print(f"[VOICE] Broadcasting user {user_id} joined to channel {channel_id}")
             await self.broadcast_to_channel(channel_id, message)
 
     async def broadcast_user_left(self, channel_id, user_id):
         if channel_id in self.voice_channels:
             message = {
                 'type': 'participant_left',
-                'userId': user_id,
-                'isEchoMode': len(self.voice_channels[channel_id]) <= 1
+                'userId': user_id
             }
             await self.broadcast_to_channel(channel_id, message)
 
@@ -156,15 +310,8 @@ class VoiceChannelManager:
                         await websocket.send_json(message)
                 except Exception as e:
                     print(f"Error broadcasting to user {user_id}: {e}")
-
-    async def broadcast_audio(self, channel_id, sender_id, audio_data):
-        if channel_id in self.voice_channels:
-            message = {
-                'type': 'audio',
-                'sender_id': sender_id,
-                'data': audio_data
-            }
-            await self.broadcast_to_channel(channel_id, message)
+                    # Если не удалось отправить сообщение, отключаем пользователя
+                    await self.disconnect_user(user_id)
 
     async def broadcast_video(self, channel_id, sender_id, video_data):
         if channel_id in self.voice_channels:
@@ -184,50 +331,58 @@ class VoiceChannelManager:
             }
             await self.broadcast_to_channel(channel_id, message)
 
-    async def disconnect_user(self, user_id):
-        if user_id in self.user_channels:
-            channel_id = self.user_channels[user_id]
-            self.voice_channels[channel_id].remove(user_id)
-            del self.user_channels[user_id]
-            
-            # Clean up audio streams
-            if user_id in self.audio_streams:
-                try:
-                    if 'input' in self.audio_streams[user_id]:
-                        input_stream = self.audio_streams[user_id]['input']
-                        if input_stream.is_active():
-                            input_stream.stop_stream()
-                        input_stream.close()
-                    if 'output' in self.audio_streams[user_id]:
-                        output_stream = self.audio_streams[user_id]['output']
-                        if output_stream.is_active():
-                            output_stream.stop_stream()
-                        output_stream.close()
-                except Exception as e:
-                    print(f"Error cleaning up audio streams for user {user_id}: {e}")
-                finally:
-                    del self.audio_streams[user_id]
-            
-            # Remove websocket reference
-            if user_id in self.user_websockets:
-                try:
-                    websocket = self.user_websockets[user_id]
-                    if websocket.open:
-                        await websocket.close(code=1000, reason="User disconnected")
-                except Exception as e:
-                    print(f"Error closing websocket for user {user_id}: {e}")
-                finally:
-                    del self.user_websockets[user_id]
-            
-            # Broadcast user left
-            await self.broadcast_user_left(channel_id, user_id)
-            
-            # Clean up empty channels
-            if not self.voice_channels[channel_id]:
-                del self.voice_channels[channel_id]
+    async def broadcast_user_state(self, channel_id, user_id):
+        if channel_id in self.voice_channels:
+            state = self.user_states.get(user_id, {})
+            message = {
+                'type': 'participant_state',
+                'participant': {
+                    'id': user_id,
+                    'isMuted': state.get('isMuted', False),
+                    'isDeafened': state.get('isDeafened', False),
+                    'isVideoEnabled': state.get('isVideoEnabled', False),
+                    'isScreenSharing': state.get('isScreenSharing', False)
+                },
+                'channel_id': channel_id
+            }
+            await self.broadcast_to_channel(channel_id, message)
 
     def cleanup(self):
+        # Clean up all audio streams
+        for stream_key in list(self.audio_streams.keys()):
+            try:
+                if 'input' in self.audio_streams[stream_key]:
+                    self.audio_streams[stream_key]['input'].stop_stream()
+                    self.audio_streams[stream_key]['input'].close()
+                if 'output' in self.audio_streams[stream_key]:
+                    self.audio_streams[stream_key]['output'].stop_stream()
+                    self.audio_streams[stream_key]['output'].close()
+            except Exception as e:
+                print(f"Error cleaning up audio stream {stream_key}: {e}")
+        self.audio_streams.clear()
         audio_handler.cleanup()
+
+    async def send_participants_list(self, channel_id):
+        if channel_id in self.voice_channels:
+            participants = []
+            for user_id in self.voice_channels[channel_id]:
+                state = self.user_states.get(user_id, {})
+                participants.append({
+                    'id': user_id,
+                    'isMuted': state.get('isMuted', False),
+                    'isDeafened': state.get('isDeafened', False),
+                    'isVideoEnabled': state.get('isVideoEnabled', False),
+                    'isScreenSharing': state.get('isScreenSharing', False)
+                })
+            
+            message = {
+                'type': 'participants',
+                'participants': participants,
+                'channel_id': channel_id
+            }
+            
+            print(f"[VOICE] Sending participants list for channel {channel_id}: {participants}")
+            await self.broadcast_to_channel(channel_id, message)
 
 voice_manager = VoiceChannelManager()
 
@@ -356,11 +511,17 @@ async def voice_channel_endpoint(websocket: WebSocket, channel_id: int, token: s
                                 print(f"[{datetime.now()}] User {user.username} joining voice channel")
                                 # Add user to voice channel participants
                                 await voice_manager.connect_user(websocket, channel_id, user.id)
+                                break
                             elif message.get("type") == "leave":
                                 print(f"[{datetime.now()}] User {user.username} leaving voice channel")
                                 # Remove user from voice channel participants
                                 await voice_manager.disconnect_user(user.id)
                                 break
+                            elif message.get("type") == "audio":
+                                # Обработка аудио данных
+                                audio_data = message.get("data")
+                                if audio_data:
+                                    await voice_manager.handle_audio_data(channel_id, user.id, audio_data)
                             elif message.get("type") == "ping":
                                 # Respond to ping with pong
                                 try:
@@ -383,17 +544,10 @@ async def voice_channel_endpoint(websocket: WebSocket, channel_id: int, token: s
                         elif "bytes" in data:
                             # Handle binary audio data
                             audio_data = data["bytes"]
-                            print(f"[{datetime.now()}] Received audio data from user {user.username}: {len(audio_data)} bytes")
+                            print(f"[{datetime.now()}] Received binary audio data from user {user.username}: {len(audio_data)} bytes")
                             
-                            # Echo audio data back to sender
-                            try:
-                                # Send the raw audio data back without modification
-                                await websocket.send_bytes(audio_data)
-                                print(f"[{datetime.now()}] Echoed audio data back to user {user.username}")
-                            except Exception as e:
-                                print(f"[{datetime.now()}] Error echoing audio: {str(e)}")
-                                # Don't break the connection on audio echo error
-                                continue
+                            # Отправляем аудио другим пользователям
+                            await voice_manager.handle_audio_data(channel_id, user.id, audio_data)
 
                 except WebSocketDisconnect:
                     print(f"[{datetime.now()}] WebSocket disconnected for user {user.username}")
@@ -821,7 +975,7 @@ def delete_channel(
 @app.post("/channels/{channel_id}/messages", response_model=schemas.Message)
 async def create_message(
     channel_id: int,
-    content: Optional[str] = None,
+    content: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
     current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db)
@@ -831,9 +985,9 @@ async def create_message(
     if not db_channel:
         raise HTTPException(status_code=404, detail="Channel not found")
     
-    # Handle file upload if present
     media_url = None
     media_type = None
+
     if file:
         # Create media directory if it doesn't exist
         os.makedirs("media", exist_ok=True)
@@ -859,7 +1013,9 @@ async def create_message(
             media_type = 'file'
         
         media_url = f"/media/{unique_filename}"
-    
+    else:
+        media_type = 'text'
+
     # Create message
     message_data = schemas.MessageCreate(
         content=content,
@@ -1307,6 +1463,21 @@ async def upload_file(file: UploadFile = File(...)):
 # Add static file serving for media
 from fastapi.staticfiles import StaticFiles
 app.mount("/media", StaticFiles(directory="media"), name="media")
+
+@app.get("/api/channels/{channel_id}/participants")
+def get_channel_participants(channel_id: int):
+    participants = []
+    if channel_id in voice_manager.voice_channels:
+        for user_id in voice_manager.voice_channels[channel_id]:
+            state = voice_manager.user_states.get(user_id, {})
+            participants.append({
+                "id": user_id,
+                "isMuted": state.get("isMuted", False),
+                "isDeafened": state.get("isDeafened", False),
+                "isVideoEnabled": state.get("isVideoEnabled", False),
+                "isScreenSharing": state.get("isScreenSharing", False)
+            })
+    return {"participants": participants}
 
 if __name__ == "__main__":
     def find_free_port(start_port=8000, max_port=8999):

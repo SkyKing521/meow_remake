@@ -101,6 +101,10 @@ const ServerView = () => {
     }, [messages]);
 
     useEffect(() => {
+        console.log('messages:', messages);
+      }, [messages]);
+
+    useEffect(() => {
         const fetchServerData = async () => {
             try {
                 const [serverRes, channelsRes] = await Promise.all([
@@ -151,19 +155,21 @@ const ServerView = () => {
         if (!newMessage.trim()) return;
 
         try {
+            const formData = new FormData();
+            formData.append('content', newMessage);
+
             const response = await axios.post(
                 `${config.API_BASE_URL}/channels/${selectedChannel.id}/messages`,
-                { content: newMessage },
+                formData,
                 {
-                    headers: { 
-                        'Authorization': `Bearer ${token}`,
-                        'Content-Type': 'application/json'
+                    headers: {
+                        'Authorization': `Bearer ${token}`
+                        // Не указываем Content-Type, axios сам выставит boundary
                     }
                 }
             );
             
             if (response.data) {
-                // Add the new message to the messages list
                 setMessages(prevMessages => [...prevMessages, response.data]);
                 setNewMessage('');
             }
@@ -624,8 +630,8 @@ const ServerView = () => {
                                                             {new Date(message.created_at).toLocaleString()}
                                                         </Typography>
                                                     </Box>
-                                                    {message.content && (
-                                                        <Typography variant="body1">{message.content}</Typography>
+                                                    {(message.content || message.text) && (
+                                                        <Typography variant="body1">{message.content || message.text}</Typography>
                                                     )}
                                                     {message.media_url && (
                                                         <Box sx={{ mt: 1 }}>

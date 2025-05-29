@@ -7,6 +7,8 @@ import Register from './components/Register';
 import Dashboard from './components/Dashboard';
 import ServerView from './components/ServerView';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
+import PersistentMusicPlayer from './components/PersistentMusicPlayer';
+import { Box } from '@mui/material';
 
 const darkTheme = createTheme({
   palette: {
@@ -56,6 +58,7 @@ function App() {
             />
           </Routes>
         </Router>
+        <PersistentMusicPlayer />
       </AuthProvider>
     </ThemeProvider>
   );

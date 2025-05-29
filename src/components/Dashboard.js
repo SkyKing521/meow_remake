@@ -21,7 +21,8 @@ import {
   Add as AddIcon,
   Home as HomeIcon,
   Logout as LogoutIcon,
-  ContentCopy as ContentCopyIcon
+  ContentCopy as ContentCopyIcon,
+  PersonAdd as PersonAddIcon
 } from '@mui/icons-material';
 import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
@@ -170,7 +171,7 @@ function Dashboard() {
                         handleGenerateInvite(server.id);
                       }}
                     >
-                      <ContentCopyIcon />
+                      <PersonAddIcon />
                     </IconButton>
                   </Tooltip>
                 }
@@ -199,6 +200,13 @@ function Dashboard() {
         </Box>
       </Drawer>
       <Box component="main" sx={{ flexGrow: 1, p: 3 }}>
+        <Box sx={{ display: 'flex', alignItems: 'center', mb: 2 }}>
+          <Typography variant="h5" sx={{ flex: 1 }}>Сервера</Typography>
+          
+          <Button variant="outlined" color="primary" onClick={() => setShowJoinDialog(true)}>
+            Присоединиться по инвайт-коду
+          </Button>
+        </Box>
         <Typography variant="h4" sx={{ mb: 2 }}>
           Добро пожаловать!
         </Typography>
@@ -228,36 +236,32 @@ function Dashboard() {
       </Dialog>
 
       <Dialog open={showJoinDialog} onClose={() => setShowJoinDialog(false)}>
-        <DialogTitle>Присоединиться к серверу</DialogTitle>
+        <DialogTitle>Присоединиться к серверу по инвайт-коду</DialogTitle>
         <DialogContent>
           <TextField
-            autoFocus
-            margin="dense"
-            label="Код приглашения"
-            fullWidth
+            label="Инвайт-код"
             value={inviteCode}
-            onChange={(e) => setInviteCode(e.target.value)}
+            onChange={e => setInviteCode(e.target.value)}
+            fullWidth
+            margin="normal"
           />
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setShowJoinDialog(false)}>Отмена</Button>
-          <Button onClick={handleJoinServer} variant="contained">
-            Присоединиться
-          </Button>
+          <Button onClick={handleJoinServer} variant="contained" color="primary">Присоединиться</Button>
         </DialogActions>
       </Dialog>
 
       <Dialog open={showInviteDialog} onClose={() => setShowInviteDialog(false)}>
-        <DialogTitle>Код приглашения для {selectedServer?.name}</DialogTitle>
+        <DialogTitle>Инвайт-код для сервера</DialogTitle>
         <DialogContent>
-          <Box sx={{ display: 'flex', alignItems: 'center', mt: 2 }}>
-            <Typography variant="h6" sx={{ mr: 2 }}>
-              {inviteCodeGenerated}
-            </Typography>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+            <TextField value={inviteCodeGenerated} InputProps={{ readOnly: true }} fullWidth />
             <IconButton onClick={() => copyToClipboard(inviteCodeGenerated)}>
               <ContentCopyIcon />
             </IconButton>
           </Box>
+          <Typography variant="caption" color="text.secondary">Передайте этот код другу для присоединения к серверу.</Typography>
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setShowInviteDialog(false)}>Закрыть</Button>
